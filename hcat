@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+# ╰───〢 Shebang
+
+import sys
+import re
+from itertools import chain
+from rich.console import Console
+from rich.text import Text
+from rich.color import Color
+from rich.table import Table
+from rich.panel import Panel
+
+# ─── TOML support ───
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None  # will be handled when -config is used
+
+console = Console()
+
+# ─────────── Custom word highlights ───────────
+CUSTOM_WORDS: dict[str, dict[str, object]] = {}   # word → {"style": str, "overwrite": bool}
+
+def addhighlight(word: str, color: str, underline: bool = False, overwrite: bool = False) -> None:
+    """Register a custom word with a colour, optional underline, and overwrite flag."""
+    try:
+        Color.parse(color)
+    except ValueError:
+        console.print(f"[#ff4b4b]Invalid colour value: {color!r}[/#ff4b4b]")
+        sys.exit(1)
+    style = color
+    if underline:
+        style += " underline"
+    CUSTOM_WORDS[word] = {"style": style, "overwrite": overwrite}
+
+
+# ─────────── Scope style overrides ───────────
+SCOPE_STYLES = {
+    "string": {"color": "#ce9178", "underline": False},
+    "comment": {"color": "#6a9955", "underline": False},
+    "number": {"color": "#b5cea8", "underline": False},
+    "function": {"color": "#dcdcaa", "underline": True},
+}
+
+def scope_style(scope_name: str) -> str:
+    """Return a Rich style string for the given scope, using overrides if set."""
+    cfg = SCOPE_STYLES.get(scope_name)
+    if not cfg:
+        return ""
+    style = cfg["color"]
+    if cfg["underline"]:
+        style += " underline"
+    return style
+
+
+# ─────────── Custom scopes (user patterns with $any) ───────────
+CUSTOM_SCOPES: list[tuple[re.Pattern, str]] = []
+
+def compile_custom_scope(pattern_str: str) -> re.Pattern:
+    """
+    Replace '$any' with a lazy wildcard (.*?) and escape the rest.
+    Returns a compiled regex.
+    """
+    parts = pattern_str.split("$any")
+    escaped_parts = [re.escape(part) for part in parts]
+    regex = ".*?".join(escaped_parts)
+    return re.compile(regex)
+
+
+# ─────────── Load config TOML ───────────
+def load_config(filepath: str) -> None:
+    """Parse a TOML config file and register all enabled custom words, scopes, and custom scopes."""
+    if tomllib is None:
+        console.print("[#ff4b4b]Error: TOML support requires tomli/tomllib. Install tomli with 'pip install tomli'[/#ff4b4b]")
+        sys.exit(1)
+
+    try:
+        with open(filepath, "rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        console.print(f"[#ff4b4b]Config file not found: {filepath}[/#ff4b4b]")
+        sys.exit(1)
+    except tomllib.TOMLDecodeError as e:
+        console.print(f"[#ff4b4b]Invalid TOML in {filepath}: {e}[/#ff4b4b]")
+        sys.exit(1)
+
+    # Validate [id] section
+    id_section = config.get("id", {})
+    if not id_section.get("config"):
+        console.print(f"[#ff4b4b]Missing or false '[id] config = true' in {filepath}[/#ff4b4b]")
+        sys.exit(1)
+
+    # ── Custom keywords ──
+    keywords = config.get("config_keyword", {})
+    if isinstance(keywords, dict):
+        for word, word_cfg in keywords.items():
+            if not isinstance(word_cfg, dict):
+                continue
+            enabled = word_cfg.get("enabled", False)
+            if not enabled:
+                continue
+            color = str(word_cfg.get("color", "#ff4b4b"))
+            underline = word_cfg.get("underline", False)
+            overwrite = word_cfg.get("overwrite", False)
+            addhighlight(word, color, underline, overwrite)
+
+    # ── Scope overrides ──
+    scopes = config.get("config_scope", {})
+    if isinstance(scopes, dict):
+        for scope_name, scope_cfg in scopes.items():
+            if scope_name not in SCOPE_STYLES:
+                console.print(f"[yellow]Warning: Unknown scope '{scope_name}' in config – ignored[/yellow]")
+                continue
+            if isinstance(scope_cfg, dict):
+                if "color" in scope_cfg:
+                    SCOPE_STYLES[scope_name]["color"] = str(scope_cfg["color"])
+                if "underline" in scope_cfg:
+                    SCOPE_STYLES[scope_name]["underline"] = bool(scope_cfg["underline"])
+
+    # ── Custom scopes (user‑defined patterns with $any) ──
+    custom_scopes = config.get("config_customScope", {})
+    if isinstance(custom_scopes, dict):
+        for pattern_str, scope_cfg in custom_scopes.items():
+            if not isinstance(scope_cfg, dict):
+                continue
+            color = str(scope_cfg.get("color", "#c586c0"))
+            underline = bool(scope_cfg.get("underline", False))
+            style = color
+            if underline:
+                style += " underline"
+            try:
+                compiled = compile_custom_scope(pattern_str)
+                CUSTOM_SCOPES.append((compiled, style))
+            except re.error as e:
+                console.print(f"[yellow]Warning: Invalid custom scope pattern '{pattern_str}' – {e}[/yellow]")
+
+
+# ─────────── Colour map ───────────
+COLOR_MAP = {
+    "type": "#569cd6",
+    "control": "#c586c0",
+    "oop": "#4ec9b0",
+    "template": "#c586c0",
+    "spec": "#9cdcfe",
+    "cast": "#dcdcaa",
+    "exception": "#c586c0",
+    "alt": "#c586c0",
+    "modern": "#569cd6",
+    "coroutine": "#c586c0",
+    "module": "#c586c0",
+    "io": "#4ec9b0",
+    "annotation": "#dcdcaa",
+    "pp": "#9cdcfe",
+}
+# (STRING_COLOR etc. are now inside SCOPE_STYLES)
+
+# ─────────── Language definitions (highlighting) ───────────
+LANG = {
+    "cpp": {
+        "kw": {
+            "type": {"int", "float", "double", "char", "bool", "void",
+                     "wchar_t", "size_t", "int8_t", "uint8_t", "long",
+                     "short", "auto", "decltype"},
+            "control": {"if", "else", "for", "while", "do", "return",
+                        "switch", "case", "break", "continue", "goto"},
+            "oop": {"class", "public", "private", "protected",
+                    "new", "delete", "virtual", "override", "final",
+                    "this", "friend", "explicit"},
+            "modern": {"namespace", "using", "nullptr", "std", "constexpr",
+                       "noexcept", "static_cast", "dynamic_cast", "const_cast",
+                       "reinterpret_cast"},
+            "io": {"cout", "cin", "endl", "cerr"},
+            "template": {"template", "typename"},
+            "exception": {"try", "catch", "throw", "throws"},
+            "spec": {"const", "static", "volatile", "register", "extern",
+                     "inline", "mutable", "thread_local"},
+        },
+        "str": [
+            re.compile(r"'(?:\\.|[^'\\\n])*'"),
+            re.compile(r'"(?:\\.|[^"\\\n])*"'),
+            re.compile(r"R\"\([^)]*\)\""),
+        ],
+        "com": [
+            re.compile(r"//.*"),
+            re.compile(r"/\*[\s\S]*?\*/"),
+        ],
+        "num": re.compile(
+            r"\b(?:0[xX][0-9a-fA-F]+"
+            r"|0[bB][01]+"
+            r"|0[0-7]*"
+            r"|\d+\.\d*(?:[eE][+-]?\d+)?[fF]?"
+            r"|\d+[eE][+-]?\d+[fF]?"
+            r"|\d+[fF]?"
+            r")\b"
+        ),
+    },
+    "c": {
+        "kw": {
+            "type": {"int", "float", "double", "char", "void", "short",
+                     "long", "signed", "unsigned", "size_t", "int8_t",
+                     "uint8_t", "typedef", "struct", "union", "enum"},
+            "control": {"if", "else", "for", "while", "do", "return",
+                        "switch", "case", "break", "continue", "goto"},
+            "spec": {"const", "static", "volatile", "register", "extern",
+                     "inline", "restrict"},
+            "pp": {"#include", "#define", "#ifdef", "#ifndef", "#endif",
+                   "#if", "#else", "#elif", "#pragma", "#error"},
+        },
+        "str": [
+            re.compile(r"'(?:\\.|[^'\\\n])*'"),
+            re.compile(r'"(?:\\.|[^"\\\n])*"'),
+        ],
+        "com": [
+            re.compile(r"//.*"),
+            re.compile(r"/\*[\s\S]*?\*/"),
+        ],
+        "num": re.compile(
+            r"\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*"
+            r"|\d+\.?\d*(?:[eE][+-]?\d+)?[fF]?|"
+            r"\d+)\b"
+        ),
+    },
+    "py": {
+        "kw": {
+            "control": {"if", "elif", "else", "for", "while", "return",
+                        "break", "continue", "pass", "raise", "try",
+                        "except", "finally", "with", "as", "assert",
+                        "yield", "def", "class", "import", "from",
+                        "global", "nonlocal", "del", "lambda"},
+            "type": {"int", "float", "str", "bool", "list", "dict",
+                     "tuple", "set", "None", "True", "False"},
+        },
+        "str": [
+            re.compile(r"'''[\s\S]*?'''"),
+            re.compile(r'"""[\s\S]*?"""'),
+            re.compile(r"'(?:\\.|[^'\\\n])*'"),
+            re.compile(r'"(?:\\.|[^"\\\n])*"'),
+        ],
+        "com": [
+            re.compile(r"#.*"),
+        ],
+        "num": re.compile(
+            r"\b(?:0[xX][0-9a-fA-F]+"
+            r"|0[bB][01]+"
+            r"|0[oO][0-7]+"
+            r"|\d+\.\d*(?:[eE][+-]?\d+)?j?"
+            r"|\d+[eE][+-]?\d+"
+            r"|\d+)"
+            r"\b"
+        ),
+    },
+    "js": {
+        "kw": {
+            "control": {"if", "else", "for", "while", "do", "switch",
+                        "case", "break", "continue", "return", "throw",
+                        "try", "catch", "finally", "async", "await"},
+            "type": {"var", "let", "const", "function", "class", "new",
+                     "delete", "typeof", "instanceof", "in", "of"},
+            "oop": {"class", "extends", "super", "this", "constructor"},
+            "modern": {"import", "export", "from", "default", "yield",
+                       "static", "get", "set"},
+            "spec": {"null", "undefined", "true", "false", "NaN", "Infinity"},
+        },
+        "str": [
+            re.compile(r"`(?:\\.|[^`\\])*`"),
+            re.compile(r"'(?:\\.|[^'\\\n])*'"),
+            re.compile(r'"(?:\\.|[^"\\\n])*"'),
+        ],
+        "com": [
+            re.compile(r"//.*"),
+            re.compile(r"/\*[\s\S]*?\*/"),
+        ],
+        "num": re.compile(
+            r"\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+"
+            r"|\d+\.\d*(?:[eE][+-]?\d+)?"
+            r"|\d+[eE][+-]?\d+"
+            r"|\d+)"
+            r"\b"
+        ),
+        "regex_lit": re.compile(r"/(?:\\.|[^/\\])+/[gimsuy]*"),
+    },
+    "java": {
+        "kw": {
+            "type": {"int", "long", "float", "double", "char", "boolean",
+                     "void", "byte", "short", "String", "var"},
+            "control": {"if", "else", "for", "while", "do", "return",
+                        "switch", "case", "break", "continue", "goto"},
+            "oop": {"class", "public", "private", "protected", "new",
+                    "this", "super", "extends", "implements", "interface",
+                    "abstract", "final", "static", "enum"},
+            "exception": {"try", "catch", "finally", "throw", "throws"},
+            "modern": {"import", "package", "synchronized", "transient",
+                       "volatile", "instanceof", "strictfp", "assert"},
+            "annotation": {"@Override", "@Deprecated", "@SuppressWarnings",
+                           "@FunctionalInterface", "@SafeVarargs"},
+        },
+        "str": [
+            re.compile(r"'(?:\\.|[^'\\\n])*'"),
+            re.compile(r'"(?:\\.|[^"\\\n])*"'),
+        ],
+        "com": [
+            re.compile(r"//.*"),
+            re.compile(r"/\*[\s\S]*?\*/"),
+        ],
+        "num": re.compile(
+            r"\b(?:0[xX][0-9a-fA-F]+"
+            r"|0[bB][01]+"
+            r"|0[0-7]*"
+            r"|\d+\.\d*(?:[eE][+-]?\d+)?[fFdD]?"
+            r"|\d+[eE][+-]?\d+[fFdD]?"
+            r"|\d+[lLfFdD]?"
+            r")\b"
+        ),
+    },
+    "css": {
+        "kw": {
+            "control": {"@media", "@import", "@charset", "@font-face", "@keyframes",
+                        "@supports", "@namespace", "@page", "@counter-style"},
+            "type": {"color", "background", "margin", "padding", "border", "font",
+                     "width", "height", "display", "position", "float", "clear",
+                     "text-align", "font-size", "font-weight", "line-height",
+                     "opacity", "transform", "transition", "animation", "box-shadow"},
+            "spec": {"px", "em", "rem", "%", "vh", "vw", "vmin", "vmax",
+                     "deg", "s", "ms", "rgb", "rgba", "hsl", "hsla", "url",
+                     "none", "auto", "inherit", "initial", "unset", "important"},
+        },
+        "str": [
+            re.compile(r"'[^'\\\n]*'"),
+            re.compile(r'"[^"\\\n]*"'),
+        ],
+        "com": [
+            re.compile(r"/\*[\s\S]*?\*/"),
+        ],
+        "num": re.compile(r"\b\d+\.?\d*(?:%|px|em|rem|vh|vw|vmin|vmax|deg|s|ms)?\b"),
+    },
+}
+
+
+# ─────────── Linter rules ───────────
+def get_linter_rules(lang: str) -> list[tuple[re.Pattern, str, str]]:
+    """Return (regex, message, fix_suggestion) for the given language."""
+    rules = [
+        (re.compile(r'\t'), "Tab character used – use spaces for indentation.", "Replace tabs with spaces."),
+        (re.compile(r' +$'), "Trailing whitespace.", "Remove spaces at end of line."),
+        (re.compile(r'.{120,}'), "Line too long (> 120 characters).", "Break into multiple lines."),
+        (re.compile(r'[^=!<>]=[^=]'), "Possible assignment '=' instead of comparison '=='?", "Use '==' for comparison."),
+    ]
+
+    lang_rules = {
+        "py": [
+            (re.compile(r'\bexcept\b\s*:'), "Bare 'except:' – catches too much.", "Specify exception type (e.g., except ValueError)."),
+            (re.compile(r'\b[a-z]+[A-Z]\w*'), "camelCase variable name – prefer snake_case.", "Use snake_case naming."),
+            (re.compile(r'print\s*$'), "Possible leftover print() statement.", "Remove or replace with logging."),
+        ],
+        "cpp": [
+            (re.compile(r'\busing namespace std;'), "using namespace std in global scope is discouraged.", "Move inside function or use std:: prefix."),
+            (re.compile(r'\bNULL\b'), "NULL used – prefer nullptr in C++11+.", "Use nullptr."),
+        ],
+        "c": [
+            (re.compile(r'\bNULL\b'), "NULL used – consider nullptr in C23 or use (void*)0.", "Use nullptr or explicit cast."),
+        ],
+        "js": [
+            (re.compile(r'\bvar\b'), "'var' – prefer 'let' or 'const'.", "Use 'let' or 'const'."),
+            (re.compile(r'(?<!\\);$'), "Missing semicolon?", "Add semicolon at end of statement."),
+            (re.compile(r'console\.(log|warn|error)\s*\('), "console.log left in production?", "Remove or use a logging library."),
+        ],
+        "java": [
+            (re.compile(r'System\.(out|err)\.print'), "System.out/err.print – consider using a logger.", "Use java.util.logging."),
+        ],
+        "css": [
+            (re.compile(r'([a-z-]+)\s*:\s*[^;]*\1\s*:'), "Duplicate property detected.", "Remove duplicate property."),
+            (re.compile(r'!important'), "!important used – avoid if possible.", "Use more specific selectors instead."),
+        ],
+    }
+    lang_rules = lang_rules.get(lang, [])
+    # Filter out None messages
+    lang_rules = [(pat, msg, fix) for pat, msg, fix in lang_rules if msg is not None]
+    return rules + lang_rules
+
+
+def lint_code(text: str, lang: str) -> tuple[list[dict], dict]:
+    lines = text.splitlines()
+    rules = get_linter_rules(lang)
+    issues = []
+    bad_lines = set()
+
+    for i, line in enumerate(lines, 1):
+        for pattern, msg, fix in rules:
+            if pattern.search(line):
+                issues.append({"line": i, "message": msg, "fix": fix})
+                bad_lines.add(i)
+        # Operator spacing check (simple)
+        if re.search(r'[a-zA-Z0-9_][+\-*/][a-zA-Z0-9_]', line) \
+           and '"' not in line and "'" not in line:
+            issues.append({"line": i, "message": "Missing whitespace around operator.", "fix": "Add spaces around operators."})
+            bad_lines.add(i)
+    return issues, {"bad_lines": bad_lines, "total_lines": len(lines)}
+
+
+# ─────────── Helpers for highlighting ───────────
+def in_ranges(pos: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in ranges)
+
+
+def build(text: str, lang: str) -> list[tuple[int, int, str]]:
+    """Return a list of (start, end, style) for colourising `text`."""
+    rules = LANG.get(lang)
+    if not rules:
+        return []
+
+    matches: list[tuple[int, int, str]] = []
+    blocked: list[tuple[int, int]] = []
+
+    # 1. Strings
+    string_style = scope_style("string")
+    for pat in rules["str"]:
+        for m in pat.finditer(text):
+            blocked.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), string_style))
+
+    # 2. Comments
+    comment_style = scope_style("comment")
+    for pat in rules["com"]:
+        for m in pat.finditer(text):
+            blocked.append((m.start(), m.end()))
+            matches.append((m.start(), m.end(), comment_style))
+
+    # 3. Keywords (skip overridden ones)
+    skip_kw = {w for w, cfg in CUSTOM_WORDS.items() if cfg.get("overwrite", False)}
+    for category, words in rules["kw"].items():
+        color = COLOR_MAP.get(category, "#00d4ff")
+        for kw in words:
+            if kw in skip_kw:
+                continue
+            pat = re.compile(rf"\b{re.escape(kw)}\b")
+            for m in pat.finditer(text):
+                if not in_ranges(m.start(), blocked):
+                    matches.append((m.start(), m.end(), color))
+
+    # 4. Numbers
+    num_style = scope_style("number")
+    num_pat = rules.get("num", re.compile(r"\b\d+(\.\d+)?\b"))
+    for m in num_pat.finditer(text):
+        if not in_ranges(m.start(), blocked):
+            matches.append((m.start(), m.end(), num_style))
+
+    # 5. Function calls
+    func_style = scope_style("function")
+    all_keywords = set(chain.from_iterable(rules["kw"].values()))
+    func_pat = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
+    for m in func_pat.finditer(text):
+        name = m.group(1)
+        start = m.start(1)
+        if in_ranges(start, blocked) or name in all_keywords:
+            continue
+        matches.append((start, m.end(1), func_style))
+
+    # 6. JavaScript regex literals (treated as strings)
+    if lang == "js" and "regex_lit" in rules:
+        lit_pat = rules["regex_lit"]
+        for m in lit_pat.finditer(text):
+            if not in_ranges(m.start(), blocked):
+                matches.append((m.start(), m.end(), string_style))
+
+    # 7. Custom scopes (user-defined patterns with $any)
+    for pat, style in CUSTOM_SCOPES:
+        for m in pat.finditer(text):
+            if not in_ranges(m.start(), blocked):
+                matches.append((m.start(), m.end(), style))
+
+    # 8. Custom words
+    for word, cfg in CUSTOM_WORDS.items():
+        style = cfg["style"]
+        if any(not c.isalnum() and c != '_' for c in word):
+            pat = re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)")
+        else:
+            pat = re.compile(r"\b" + re.escape(word) + r"\b")
+        for m in pat.finditer(text):
+            if not in_ranges(m.start(), blocked):
+                matches.append((m.start(), m.end(), style))
+
+    return matches
+
+
+def apply(text: str, matches: list[tuple[int, int, str]]) -> Text:
+    t = Text(text)
+    for s, e, c in sorted(matches, key=lambda x: x[0], reverse=True):
+        t.stylize(c, s, e)
+    return t
+
+
+# ─────────── CLI parsing ───────────
+def main() -> None:
+    args = sys.argv[1:]
+    remaining = []
+    custom_words_added = False
+    address_errors = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-address-error":
+            address_errors = True
+            i += 1
+        elif arg == "-config":
+            if i + 1 >= len(args):
+                console.print("[#ff4b4b]Error: -config requires a file path[/#ff4b4b]")
+                sys.exit(1)
+            config_path = args[i + 1]
+            load_config(config_path)
+            custom_words_added = True
+            i += 2
+        elif arg == "-self-insert":
+            if i + 1 >= len(args):
+                console.print("[#ff4b4b]Error: -self-insert requires a word[/#ff4b4b]")
+                sys.exit(1)
+            word = args[i + 1]
+            i += 2
+            color = None
+            underline = False
+            overwrite = False   # 🔧 FIX: initialised here
+            while i < len(args) and args[i] in ("-color", "-color-hex", "-color-rgb", "-underline", "-overwrite"):
+                opt = args[i]
+                if opt == "-color":
+                    if i + 1 >= len(args):
+                        console.print("[#ff4b4b]Error: -color requires a value[/#ff4b4b]")
+                        sys.exit(1)
+                    color = args[i + 1]
+                    i += 2
+                elif opt == "-color-hex":
+                    if i + 1 >= len(args):
+                        console.print("[#ff4b4b]Error: -color-hex requires a value[/#ff4b4b]")
+                        sys.exit(1)
+                    hex_val = args[i + 1]
+                    if not hex_val.startswith("#"):
+                        hex_val = "#" + hex_val
+                    color = hex_val
+                    i += 2
+                elif opt == "-color-rgb":
+                    if i + 1 >= len(args):
+                        console.print("[#ff4b4b]Error: -color-rgb requires a value[/#ff4b4b]")
+                        sys.exit(1)
+                    rgb_val = args[i + 1].strip()
+                    color = f"rgb({rgb_val})"
+                    i += 2
+                elif opt == "-underline":
+                    if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                        val = args[i + 1]
+                        if val.lower() == "true":
+                            underline = True
+                        elif val.lower() == "false":
+                            underline = False
+                        else:
+                            console.print("[#ff4b4b]Error: -underline expects 'true' or 'false'[/#ff4b4b]")
+                            sys.exit(1)
+                        i += 2
+                    else:
+                        underline = True
+                        i += 1
+                elif opt == "-overwrite":
+                    if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                        val = args[i + 1]
+                        if val.lower() == "true":
+                            overwrite = True
+                        elif val.lower() == "false":
+                            overwrite = False
+                        else:
+                            console.print("[#ff4b4b]Error: -overwrite expects 'true' or 'false'[/#ff4b4b]")
+                            sys.exit(1)
+                        i += 2
+                    else:
+                        overwrite = True
+                        i += 1
+            if color is None:
+                color = "#ff4b4b"
+            addhighlight(word, color, underline, overwrite)   # 🔧 FIX: now passing overwrite
+            custom_words_added = True
+        else:
+            remaining.append(arg)
+            i += 1
+
+    if not custom_words_added:
+        addhighlight("print", "#ff4b4b")
+
+    if len(remaining) < 1:
+        console.print("[#ff4b4b]Usage: hcat [-config <file>] [-address-error] [-self-insert ...] (ext) filename[/#ff4b4b]")
+        sys.exit(1)
+
+    if len(remaining) == 2:
+        ext, name = remaining[0], remaining[1]
+        file = f"{name}.{ext}"
+        lang = ext
+    else:
+        file = remaining[0]
+        lang = file.rsplit(".", 1)[-1] if "." in file else None
+
+    try:
+        with open(file, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as err:
+        console.print(f"[#ff4b4b]File error: {err}[/#ff4b4b]")
+        sys.exit(1)
+
+    if address_errors:
+        issues, summary = lint_code(content, lang)
+        bad_count = len(summary["bad_lines"])
+        good_count = summary["total_lines"] - bad_count
+        console.print(Panel(f"[bold]Code Quality Report – {file}[/bold]\n"
+                            f"Language: {lang or 'unknown'}",
+                            style="#ffffff"))
+        if issues:
+            table = Table(title="Issues Found", show_header=True, header_style="bold yellow")
+            table.add_column("Line", style="#ff4b4b", width=6)
+            table.add_column("Issue", style="#ffa500")
+            table.add_column("How to fix", style="#00ff7f")
+            for issue in issues:
+                table.add_row(str(issue["line"]), issue["message"], issue["fix"])
+            console.print(table)
+        else:
+            console.print("[green]No issues found![/green]")
+        console.print(f"\nbad  : {bad_count} line(s) with issues\n"
+                      f"good : {good_count} clean line(s)")
+        return
+
+    matches = build(content, lang)
+    styled = apply(content, matches)
+    console.print(styled)
+
+
+if __name__ == "__main__":
+    main()
